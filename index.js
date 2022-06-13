@@ -60,12 +60,45 @@ let audioBuffer;
 let performanceGainNode;
 let mainGainNode;
 
+let mediaRecorder;
+let chunks = [];
+
+async function askRecord() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const [device] = devices.filter((device) => device.label === 'USB Audio CODEC  (08bb:2902)' && device.kind === 'audiooutput');
+    let constraints = { audio: true };
+    if(device !== undefined) {
+      constraints = { audio: { deviceId: device.deviceId } };
+    }
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.onstop = mediaRecorderStop
+    mediaRecorder.ondataavailable = function(e) {
+      chunks.push(e.data);
+    }
+}
+function resetRnn() {
+  c = [
+    tf.zeros([1, lstmBias1.shape[0] / 4]),
+    tf.zeros([1, lstmBias2.shape[0] / 4]),
+    tf.zeros([1, lstmBias3.shape[0] / 4]),
+  ];
+  h = [
+    tf.zeros([1, lstmBias1.shape[0] / 4]),
+    tf.zeros([1, lstmBias2.shape[0] / 4]),
+    tf.zeros([1, lstmBias3.shape[0] / 4]),
+  ];
+
+  lastSample?.dispose();
+  lastSample = tf.scalar(PRIMER_IDX, 'int32');
+}
+
 async function load() {
     ctx = new AudioContext({ sampleRate: 44100 });
     guitar = new Guitar(ctx);
     const comperessorNode = ctx.createDynamicsCompressor();
     performanceGainNode = ctx.createGain();
-    performanceGainNode.gain.setValueAtTime(0.02, ctx.currentTime)
+    performanceGainNode.gain.setValueAtTime(0.01, ctx.currentTime)
     await guitar.connect(performanceGainNode);
 
     performanceGainNode.connect(comperessorNode);
@@ -101,22 +134,6 @@ async function load() {
     console.log('loaded')
 }
 
-function resetRnn() {
-  c = [
-    tf.zeros([1, lstmBias1.shape[0] / 4]),
-    tf.zeros([1, lstmBias2.shape[0] / 4]),
-    tf.zeros([1, lstmBias3.shape[0] / 4]),
-  ];
-  h = [
-    tf.zeros([1, lstmBias1.shape[0] / 4]),
-    tf.zeros([1, lstmBias2.shape[0] / 4]),
-    tf.zeros([1, lstmBias3.shape[0] / 4]),
-  ];
-
-  lastSample?.dispose();
-  lastSample = tf.scalar(PRIMER_IDX, 'int32');
-}
-
 function getConditioning() {
   return tf.tidy(() => {
       const axis = 0;
@@ -125,86 +142,156 @@ function getConditioning() {
   });
 }
 
+let currentForm = 0;
+const barSize = 32;
+
+const form = [{
+  shiftWhenNoteOn: true,
+  shift: 15,
+  noteValue: 16 / barSize
+}, {
+  shiftWhenNoteOn: true,
+  shift: 1,
+  noteValue: 16 / barSize
+}, {
+  shiftWhenNoteOn: false,
+  shift: 1,
+  noteValue: 16 / barSize
+}]
+
 async function generate() {
-    updateConditioningParams();
-    playOutPos = 0;
-    serias = new Float32Array(partSize).map((v) => NaN);
+    let playOutPos = 0;
+    let serias = new Float32Array(partSize).map((v) => NaN);
+    let velocitySerias = new Float32Array(partSize).map(v=>0);
+    let effectSerias = new Float32Array(partSize).map(v=>0);
+    let noteValueSerias = new Float32Array(partSize).map(v=>0);
     while (playOutPos < partSize) {
-        generateStep();
+        const lstm1 = (data, c, h) => tf.basicLSTMCell(forgetBias, lstmKernel1, lstmBias1, data, c, h);
+        const lstm2 = (data, c, h) => tf.basicLSTMCell(forgetBias, lstmKernel2, lstmBias2, data, c, h);
+        const lstm3 = (data, c, h) => tf.basicLSTMCell(forgetBias, lstmKernel3, lstmBias3, data, c, h);
+
+        let outputs = [];
+        [c, h, outputs] = tf.tidy(() => {
+          // Generate some notes.
+          const innerOuts = [];
+          for (let i = 0; i < STEPS_PER_GENERATE_CALL; i++) {
+            // Use last sampled output as the next input.
+            const eventInput = tf.oneHot(lastSample.as1D(), EVENT_SIZE).as1D();
+            // Dispose the last sample from the previous generate call, since we
+            // kept it.
+            if (i === 0) {
+              lastSample.dispose();
+            }
+            const conditioning = getConditioning();
+            const axis = 0;
+            const input = conditioning.concat(eventInput, axis).toFloat();
+            const output = tf.multiRNNCell([lstm1, lstm2, lstm3], input.as2D(1, -1), c, h);
+
+            c.forEach(c => c.dispose());
+            h.forEach(h => h.dispose());
+
+
+            c = output[0];
+            h = output[1];
+
+            const outputH = h[2];
+            const logits = outputH.matMul(fcW).add(fcB);
+
+            const sampledOutput = tf.multinomial(logits.as1D(), 1).asScalar();
+
+            innerOuts.push(sampledOutput);
+            lastSample = sampledOutput;
+          }
+          return [c, h, innerOuts];
+        });
+        for (let i = 0; i < outputs.length; i++) {
+          const index = outputs[i].dataSync()[0];
+          let offset = 0;
+          const localForm = form[currentForm];
+          for (const eventRange of EVENT_RANGES) {
+              const eventType = eventRange[0];
+              const minValue = eventRange[1];
+              const maxValue = eventRange[2];
+              if (offset <= index && index <= offset + maxValue - minValue) {
+                  if (eventType === 'note_on') {
+                    const noteNum = index - offset;
+                    serias[playOutPos] = Math.round(noteNum/36 % 1 * 36);
+                    velocitySerias[playOutPos] = currentVelocity;
+                    effectSerias[playOutPos] = slide;
+                    noteValueSerias[playOutPos] = localForm.noteValue;
+                    if (localForm.shiftWhenNoteOn) {
+                      playOutPos++;
+                    }
+                    slide = 0
+                    console.log('note add')
+                    break
+                  } else if (eventType === 'note_off') {
+                    const noteNum = index - offset;
+                    if (noteNum % localForm.shift === 0) {
+                      playOutPos++;
+                    }
+                    //console.log('note_off', noteNum);
+                    /* потушить ноту noTeNum?*/
+                    break;
+                  } else if (eventType === 'time_shift') {
+                    const noteNum = index - offset;
+                    if (noteNum%5 === 0 && noteNum !== 0) {
+                       slide = 1
+                        console.log('slide')
+                    }
+ 
+                    if (noteNum%13 === 0 && noteNum !== 0 ) {
+                       currentForm = 0
+                       console.log(noteNum)
+                       console.log('form 0')
+                    }
+                    if (noteNum%14=== 0 && noteNum !== 0 ) {
+                       currentForm = 1
+                       console.log(noteNum)
+                       console.log('form 1')
+                    }
+                    if (noteNum%15=== 0 && noteNum !== 0) {
+                       currentForm = 2
+                       console.log(noteNum)
+                       console.log('form 2')
+                    }
+                    break;
+                  } else if (eventType === 'velocity_change') {
+                    currentVelocity = (index - offset + 1) * Math.ceil(127 / VELOCITY_BINS);
+                    currentVelocity = currentVelocity / 127;
+                    break;
+                  } else {
+                    throw new Error('Could not decode eventType: ' + eventType);
+                  }
+              }
+
+              offset += maxValue - minValue + 1;
+          }
+        }
     }
 
     console.log('generated', serias, velocitySerias, effectSerias)
-    return {
-      serias,
-      velocitySerias,
-      effectSerias
-    }
+    return { serias, velocitySerias, effectSerias, noteValueSerias };
 }
-
-function generateStep() {
-  const lstm1 = (data, c, h) => tf.basicLSTMCell(forgetBias, lstmKernel1, lstmBias1, data, c, h);
-  const lstm2 = (data, c, h) => tf.basicLSTMCell(forgetBias, lstmKernel2, lstmBias2, data, c, h);
-  const lstm3 = (data, c, h) => tf.basicLSTMCell(forgetBias, lstmKernel3, lstmBias3, data, c, h);
-
-  let outputs = [];
-  [c, h, outputs] = tf.tidy(() => {
-    // Generate some notes.
-    const innerOuts = [];
-    for (let i = 0; i < STEPS_PER_GENERATE_CALL; i++) {
-      // Use last sampled output as the next input.
-      const eventInput = tf.oneHot(lastSample.as1D(), EVENT_SIZE).as1D();
-      // Dispose the last sample from the previous generate call, since we
-      // kept it.
-      if (i === 0) {
-        lastSample.dispose();
-      }
-      const conditioning = getConditioning();
-      const axis = 0;
-      const input = conditioning.concat(eventInput, axis).toFloat();
-      const output = tf.multiRNNCell([lstm1, lstm2, lstm3], input.as2D(1, -1), c, h);
-
-      c.forEach(c => c.dispose());
-      h.forEach(h => h.dispose());
-
-
-      c = output[0];
-      h = output[1];
-
-      const outputH = h[2];
-      const logits = outputH.matMul(fcW).add(fcB);
-
-      const sampledOutput = tf.multinomial(logits.as1D(), 1).asScalar();
-
-      innerOuts.push(sampledOutput);
-      lastSample = sampledOutput;
-    }
-    return [c, h, innerOuts];
-  });
-
-  for (let i = 0; i < outputs.length; i++) {
-    playOutput(outputs[i].dataSync()[0])
-  }
-}
-
 
 const notes = [
   'C', 'Cs', 'D', 'Ds', 'E', 'F', 'Fs', 'G', 'Gs', 'A', 'As', 'H',
-  'c', 'cs', 'd', 'ds', 'e', 'f', 'fs', 'g', 'gs', 'a', 'as', 'h'
+  'c', 'cs', 'd', 'ds', 'e', 'f', 'fs', 'g', 'gs', 'a', 'as', 'h',
+  'c1', 'cs1', 'd1', 'ds1', 'e1', 'f1', 'fs1', 'g1', 'gs1', 'a1', 'as1', 'h1'
  ];
 
 const NOTES_PER_OCTAVE = 12;
 const DENSITY_BIN_RANGES = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
 const PITCH_HISTOGRAM_SIZE = NOTES_PER_OCTAVE;
 
-let pitchHistogram = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
-function updateConditioningParams() {
+function updateConditioningParams(pitchHistogram) {
   noteDensityEncoding?.dispose();
   noteDensityEncoding = undefined;
   if (pitchHistogram.filter(v=>v !== 0).length === 0) {
     pitchHistogram = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
   }
 
-  const noteDensityIdx = 5;
+  const noteDensityIdx = 8;
   noteDensityEncoding = tf.oneHot(tf.tensor1d([noteDensityIdx + 1], 'int32'), DENSITY_BIN_RANGES.length + 1).as1D();
 
   pitchHistogramEncoding?.dispose();
@@ -218,157 +305,15 @@ function updateConditioningParams() {
   pitchHistogramEncoding = buffer.toTensor();
 }
 
-const barSize = 32;
 const barTime = 8000;
 
 const  partSize = barSize * 8;
-const emptyPartSize = barSize *4;
-let playOutPos = 0;
-let serias = new Float32Array(partSize).map((v) => NaN);
-let velocitySerias = new Float32Array(partSize).map(v=>0);
-let effectSerias = new Float32Array(partSize).map(v=>0);
+const emptyPartSize = barSize * 1;
+
 let currentVelocity = 0.4;
 let slide = 0
-function playOutput(index) {
-    let offset = 0;
-    for (const eventRange of EVENT_RANGES) {
-        const eventType = eventRange[0];
-        const minValue = eventRange[1];
-        const maxValue = eventRange[2];
-        if (offset <= index && index <= offset + maxValue - minValue) {
-            if (eventType === 'note_on') {
-              const noteNum = index - offset;
-              serias[playOutPos] = Math.round(noteNum/24 % 1 * 24);
-              velocitySerias[playOutPos] = currentVelocity;
-              effectSerias[playOutPos] = slide;
-              slide = 0
-              return
-            } else if (eventType === 'note_off') {
 
-              playOutPos++;
-              //console.log('note_off', noteNum);
-              /* потушить ноту noTeNum?*/
-              return;
-            } else if (eventType === 'time_shift') {
-              const noteNum = index - offset;
-              if (noteNum%15 === 0) {
-                /* temporary */
-                 slide = 1
-              }
-              
-              return;
-            } else if (eventType === 'velocity_change') {
-              
-              currentVelocity = (index - offset + 1) * Math.ceil(127 / VELOCITY_BINS);
-              currentVelocity = currentVelocity / 127;
-              return;
-            } else {
-              throw new Error('Could not decode eventType: ' + eventType);
-            }
-        }
-
-        offset += maxValue - minValue + 1;
-    }
-}
-
-let playIndex = 0;
-let intervalId = 0;
-function play1() {
-    console.log(serias)
-    const playSource = ctx.createBufferSource();
-    playSource.buffer = audioBuffer;
-    playSource.connect(ctx.destination);
-    playSource.start();
-    playTick();
-    intervalId = setInterval(playTick, barTime / barSize);
-}
-
-function playTick() {
-  const noteIndex = serias[playIndex];
-  const velocity = velocitySerias[playIndex];
-  const slide = effectSerias[playIndex];
-  if (noteIndex === undefined) {
-      clearInterval(intervalId);
-      intervalId = 0;
-      playIndex = 0;
-      return
-  }
-  const note = notes[noteIndex];
-  if (note !== undefined) {
-    guitar.play(note, 16 / barSize, velocity, slide === 1);
-  }
-  playIndex++;
-}
-
-let intervalIDBassAnalyzing;
-let intervalBassAnalyzingIndex = 0;
 let pitches = [];
-
-function detectPich() {
-  if (intervalBassAnalyzingIndex > 32) {
-      clearInterval(intervalIDBassAnalyzing);
-      const newNotes = pitches.filter((v) => v !== -1).map(noteFromPitch)
-      pitchHistogram = [0,0,0,0,0,0,0,0,0,0,0,0];
-      newNotes.forEach((note) => {
-          pitchHistogram[note%12] = 2;
-          if (pitchHistogram[note%12 + 7]) {
-              pitchHistogram[note%12 + 7] = 1
-          }
-      });
-
-      console.log(pitchHistogram);
-      console.log('Bass check complete');
-  }
-  /* надо определять ноту чуть позже такта */
-  analyser.getFloatTimeDomainData(arrayData);
-  const ac = autoCorrelate(arrayData, ctx.sampleRate);
-  console.log(ac)
-  pitches.push(ac);
-  intervalBassAnalyzingIndex++;
-}
-
-function bassAnalysing() {
-    pitches = [];
-    source.buffer = audioBuffer;
-    source.start();
-
-    intervalIDBassAnalyzing = setInterval(() => detectPich(), 250);
-}
-
-let mediaRecorder;
-let chunks = [];
-function onSuccess(stream) {
-    mediaRecorder = new MediaRecorder(stream);
-    mediaRecorder.onstop = mediaRecorderStop
-    mediaRecorder.ondataavailable = function(e) {
-      chunks.push(e.data);
-    }
-}
-
-function askRecord() {
-    var constraints = { audio: true };
-    navigator.getUserMedia(constraints, onSuccess, ()=>{ console.log('recordError ')});
-}
-
-let recordInterval;
-let recordIntervalIndex = 0;
-
-function startRecord() {
-    recordInterval = setInterval(() => {
-        guitar.play('c', 0.01);
-        if (recordIntervalIndex === 4) {
-             mediaRecorder.start();
-        }
-
-        if (recordIntervalIndex === 20) {
-            clearInterval(recordInterval);
-            mediaRecorder.stop();
-        }
-        recordIntervalIndex++
-    }, 1000)
-    //mediaRecorder.start();
-}
-
 
 let tickIntervalID;
 let tickIndex = 0;
@@ -399,7 +344,9 @@ let performanceStart = [NaN, NaN];
 let generateID = 0;
 let generateIndex;
 let firstGeneration = true;
-function startRecord2() {
+
+function start() {
+   console.log('Ready?');
     tickIntervalID = setInterval(() => {
         const isMetrPoint = tickIndex % metr === 0;
         if (isMetrPoint && source.buffer === null) {
@@ -414,7 +361,6 @@ function startRecord2() {
              console.log('Record Started', tickIndex);
              mediaRecorder.start();
         }
-
 
         if ((recordTickStart + recordTickNumbers) === tickIndex) {
             console.log('Record completed loading', tickIndex);
@@ -434,7 +380,7 @@ function startRecord2() {
              console.log('Analysing', tickIndex);
              analysingStartedIndex = tickIndex;
           }
-          detectPich2();
+          detectPitch();
           if (tickIndex - analysingStartedIndex === recordTickNumbers) {
             analysingCompleted = true
           }
@@ -442,14 +388,16 @@ function startRecord2() {
 
         if (analysingCompleted && !pitchSaved) {
           const newNotes = pitches.filter((v) => v !== -1).map(noteFromPitch)
-          pitchHistogram = [0,0,0,0,0,0,0,0,0,0,0,0];
+          const pitchHistogram = [0,0,0,0,0,0,0,0,0,0,0,0];
           newNotes.forEach((note) => {
               pitchHistogram[note%12] = 2;
               if (pitchHistogram[note%12 + 7]) {
                   pitchHistogram[note%12 + 7] = 1
               }
           });
+
           console.log('Analysing completed', pitchHistogram);
+          updateConditioningParams(pitchHistogram);
           pitchSaved = true;
            (async (identifire) => {
              results[identifire] = await generate();
@@ -458,7 +406,7 @@ function startRecord2() {
           })(0)
         }
 
-        if (performanceStart[1] + 1 === tickIndex) {
+        if (partSize + performanceStart[1] === tickIndex) {
           (async (identifire) => {
              results[identifire] = await generate();
              generationComplete[identifire] = true;
@@ -472,10 +420,10 @@ function startRecord2() {
         }
 
         if (performanceStart[0] <= tickIndex && tickIndex < partSize + performanceStart[0]) {
-           playTick2(0, tickIndex - performanceStart[0]);
+           playTick(0, tickIndex - performanceStart[0]);
         }
 
-        if (performanceStart[0] + 1 === tickIndex) {
+        if (partSize + performanceStart[0] === tickIndex) {
           (async (identifire) => {
             results[identifire] = await generate()
             generationComplete[identifire] = true;
@@ -489,7 +437,7 @@ function startRecord2() {
         }
 
         if (performanceStart[1] <= tickIndex && tickIndex < partSize + performanceStart[1]) {
-           playTick2(1, tickIndex - performanceStart[1]);
+           playTick(1, tickIndex - performanceStart[1]);
         }
 
         if (partSize + performanceStart[1] === tickIndex) {
@@ -500,28 +448,27 @@ function startRecord2() {
     }, tickSize)
 }
 
-function playTick2(resultIndex, stepIndex) {
+function playTick(resultIndex, stepIndex) {
   const noteIndex = results[resultIndex].serias[stepIndex];
   const velocity = results[resultIndex].velocitySerias[stepIndex];
   const slide = results[resultIndex].effectSerias[stepIndex];
+  const noteValue = results[resultIndex].noteValueSerias[stepIndex];
   const note = notes[noteIndex];
   if (note !== undefined) {
-    guitar.play(note, 16 / barSize, velocity, slide === 1);
+    guitar.play(note, noteValue, velocity, slide === 1);
   }
 }
 
 
-function detectPich2() {
+function detectPitch() {
   analyser.getFloatTimeDomainData(arrayData);
   const ac = autoCorrelate(arrayData, ctx.sampleRate);
   console.log(ac)
   pitches.push(ac);
 }
 
-
 function mediaRecorderStop(e) {
-    console.log("onstop() called.", e);
-    var blob = new Blob(chunks, { 'type': 'audio/wav' });
+    const blob = new Blob(chunks, { 'type': 'audio/wav' });
     chunks = [];
     var reader = new FileReader();
     reader.addEventListener("loadend", async function() {
@@ -531,10 +478,6 @@ function mediaRecorderStop(e) {
     reader.readAsArrayBuffer(blob);
 }
 
-function start() {
-  console.log('Ready?');
-  startRecord2();
-}
 function stop() {
   clearInterval(tickIntervalID);
   source.stop();
@@ -548,11 +491,6 @@ function performanceGainChange(e) {
 }
 
 document.getElementById('load').addEventListener('click', load);
-document.getElementById('askRecord').addEventListener('click', askRecord);
-document.getElementById('record').addEventListener('click', startRecord);
-document.getElementById('play1').addEventListener('click', play1);
-document.getElementById('generate').addEventListener('click', generate);
-document.getElementById('bassAnalysing').addEventListener('click', bassAnalysing);
 document.getElementById('start').addEventListener('click', start);
 document.getElementById('stop').addEventListener('click', stop);
 
