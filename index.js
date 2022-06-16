@@ -1,6 +1,6 @@
-import { MetalString } from './helpers-link/guitar/key3.5.js';
-import { Guitar } from './helpers-link/guitar/guitar.js';
-import { autoCorrelate, noteFromPitch } from './helpers-link/auto-correlate.js';
+import { MetalString } from './helpers/guitar/key3.5.js';
+import { Guitar } from './helpers/guitar/guitar.js';
+import { autoCorrelate, noteFromPitch } from './helpers/auto-correlate.js';
 import { CheckpointLoader } from './checkpoint-loader.js';
 
 let lstmKernel1;
@@ -114,9 +114,6 @@ async function load() {
     source.connect(analyser);
     analyser.connect(mainGainNode)
     mainGainNode.connect(ctx.destination)
-    const resp = await fetch("./sources-link/7army.m4a");
-    const arrayBuffer = await resp.arrayBuffer();
-    audioBuffer = await ctx.decodeAudioData(arrayBuffer);
 
     const vars  = await new CheckpointLoader().getAllVariables();
 
@@ -219,42 +216,17 @@ async function generate() {
                     velocitySerias[playOutPos] = currentVelocity;
                     effectSerias[playOutPos] = slide;
                     noteValueSerias[playOutPos] = localForm.noteValue;
-                    if (localForm.shiftWhenNoteOn) {
-                      playOutPos++;
-                    }
                     slide = 0
-                    console.log('note add')
                     break
                   } else if (eventType === 'note_off') {
                     const noteNum = index - offset;
-                    if (noteNum % localForm.shift === 0) {
-                      playOutPos++;
+                    if (noteNum%3 === 0 && noteNum !== 0) {
+                       slide = 1
                     }
-                    //console.log('note_off', noteNum);
-                    /* потушить ноту noTeNum?*/
+                   
                     break;
                   } else if (eventType === 'time_shift') {
-                    const noteNum = index - offset;
-                    if (noteNum%5 === 0 && noteNum !== 0) {
-                       slide = 1
-                        console.log('slide')
-                    }
- 
-                    if (noteNum%13 === 0 && noteNum !== 0 ) {
-                       currentForm = 0
-                       console.log(noteNum)
-                       console.log('form 0')
-                    }
-                    if (noteNum%14=== 0 && noteNum !== 0 ) {
-                       currentForm = 1
-                       console.log(noteNum)
-                       console.log('form 1')
-                    }
-                    if (noteNum%15=== 0 && noteNum !== 0) {
-                       currentForm = 2
-                       console.log(noteNum)
-                       console.log('form 2')
-                    }
+                    playOutPos++;
                     break;
                   } else if (eventType === 'velocity_change') {
                     currentVelocity = (index - offset + 1) * Math.ceil(127 / VELOCITY_BINS);
@@ -291,7 +263,7 @@ function updateConditioningParams(pitchHistogram) {
     pitchHistogram = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
   }
 
-  const noteDensityIdx = 8;
+  const noteDensityIdx = 6;
   noteDensityEncoding = tf.oneHot(tf.tensor1d([noteDensityIdx + 1], 'int32'), DENSITY_BIN_RANGES.length + 1).as1D();
 
   pitchHistogramEncoding?.dispose();
@@ -327,7 +299,7 @@ let preRecordTickNumbers = 2 * barTickNumber;
 let counterStart = 1 * barTickNumber;
 let counterTicksNumbers = 1 * barTickNumber;
 
-let recordTickNumbers = 3 * barTickNumber;
+let recordTickNumbers = 2 * barTickNumber;
 let recordTickStart = preRecordTickNumbers
 
 
